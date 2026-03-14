@@ -39,7 +39,10 @@ Usage:
 
 import numpy as np
 import pandas as pd
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
@@ -110,6 +113,81 @@ ALL_UNIVERSAL_FEATURES = (
     TEMPORAL_FEATURES +
     REGIME_FEATURES
 )
+
+
+# ORB-specific feature names (added by add_orb_features)
+ORB_SPECIFIC_FEATURES = [
+    'or_range_atr', 'or_range_relative', 'breakout_strength_atr',
+    'gap_alignment', 'vwap_dist_at_breakout_atr',
+]
+
+# Session reference feature names (added by add_session_reference_features)
+SESSION_REFERENCE_FEATURES = [
+    'dist_prior_high_atr', 'dist_prior_low_atr', 'dist_session_open_atr',
+    'vwap_dist_atr', 'session_range_position', 'gap_pct', 'ib_position',
+]
+
+
+def get_expected_feature_columns() -> list[str]:
+    """
+    Return the canonical ordered list of feature column names that
+    the model may use. Includes universal features (from build_features),
+    ORB-specific features, and session reference features.
+    """
+    return (
+        list(ALL_UNIVERSAL_FEATURES) +
+        ORB_SPECIFIC_FEATURES +
+        SESSION_REFERENCE_FEATURES
+    )
+
+
+def extract_event_features_row(
+    df_bars: pd.DataFrame,
+    event_time: pd.Timestamp,
+) -> Optional[pd.DataFrame]:
+    """
+    Given a rolling DataFrame of recent bars (OHLCV + DatetimeIndex),
+    compute all universal features for the bar at `event_time`.
+
+    Returns a single-row DataFrame with available feature columns, or None
+    if insufficient history or event_time not in index.
+
+    Args:
+        df_bars:    DataFrame with OHLCV columns and DatetimeIndex.
+                    Should contain >= 50 bars for fast features.
+        event_time: The timestamp of the event bar.
+    """
+    from research_utils.feature_engineering import build_features
+
+    if len(df_bars) < 50:
+        logger.warning(f"[FEATURES] Insufficient bar history ({len(df_bars)} bars, need >= 50)")
+        return None
+
+    if event_time not in df_bars.index:
+        logger.warning(f"[FEATURES] event_time {event_time} not in bar buffer index")
+        return None
+
+    # Build bar-level features on the available history
+    feature_df = build_features(df_bars.copy(), add_targets_flag=False)
+
+    if event_time not in feature_df.index:
+        logger.warning(f"[FEATURES] event_time lost after build_features")
+        return None
+
+    row = feature_df.loc[[event_time]]
+
+    # Return all available universal features
+    available = [c for c in ALL_UNIVERSAL_FEATURES if c in row.columns]
+    missing = [c for c in ALL_UNIVERSAL_FEATURES if c not in row.columns]
+
+    if missing:
+        logger.debug(f"[FEATURES] {len(missing)} universal features not computed: {missing[:5]}...")
+
+    if not available:
+        logger.warning("[FEATURES] No universal features could be computed")
+        return None
+
+    return row[available]
 
 
 def extract_universal_features(

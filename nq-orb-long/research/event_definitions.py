@@ -23,6 +23,13 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
+# P5-F: Numba acceleration for CUSUM detector
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 
 # ===========================================================================
 # SESSION UTILITIES (shared across events)
@@ -112,14 +119,7 @@ def add_session_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _true_range(df: pd.DataFrame) -> pd.Series:
-    """True Range = max(H-L, |H-prevC|, |L-prevC|)."""
-    prev_close = df['close'].shift(1)
-    return pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - prev_close).abs(),
-        (df['low'] - prev_close).abs()
-    ], axis=1).max(axis=1)
+from research_utils.utils import true_range as _true_range
 
 
 # ===========================================================================
@@ -289,6 +289,59 @@ def detect_orb(
 # EVENT 3: CUSUM DIRECTIONAL THRESHOLD
 # ===========================================================================
 
+def _cusum_session_loop_py(log_ret_arr, close_arr, rth_mask_arr, date_ids, n):
+    """Pure Python session-anchored CUSUM loop (fallback)."""
+    cusum_pos = np.zeros(n, dtype=np.float64)
+    cusum_neg = np.zeros(n, dtype=np.float64)
+    running_pos = 0.0
+    running_neg = 0.0
+    prev_date = -1
+
+    for i in range(n):
+        if not rth_mask_arr[i]:
+            cusum_pos[i] = 0.0
+            cusum_neg[i] = 0.0
+            continue
+
+        current_date = date_ids[i]
+        if current_date != prev_date:
+            running_pos = 0.0
+            running_neg = 0.0
+            prev_date = current_date
+
+        r = log_ret_arr[i]
+        if np.isnan(r):
+            r = 0.0
+        r_points = r * close_arr[i]
+
+        running_pos = max(0.0, running_pos + r_points)
+        running_neg = min(0.0, running_neg + r_points)
+
+        cusum_pos[i] = running_pos
+        cusum_neg[i] = running_neg
+
+    return cusum_pos, cusum_neg
+
+
+def _cusum_rolling_loop_py(r_points_arr, n):
+    """Pure Python rolling CUSUM loop (fallback)."""
+    cusum_pos = np.zeros(n, dtype=np.float64)
+    cusum_neg = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        cusum_pos[i] = max(0.0, cusum_pos[i-1] + r_points_arr[i])
+        cusum_neg[i] = min(0.0, cusum_neg[i-1] + r_points_arr[i])
+    return cusum_pos, cusum_neg
+
+
+# P5-F: Numba JIT versions (if available)
+if HAS_NUMBA:
+    _cusum_session_loop = njit(_cusum_session_loop_py)
+    _cusum_rolling_loop = njit(_cusum_rolling_loop_py)
+else:
+    _cusum_session_loop = _cusum_session_loop_py
+    _cusum_rolling_loop = _cusum_rolling_loop_py
+
+
 def detect_cusum(
     df: pd.DataFrame,
     threshold_atr_multiple: float = 1.5,
@@ -333,55 +386,30 @@ def detect_cusum(
 
     if anchor == 'session':
         # Session-anchored: reset CUSUM at each RTH open
-        rth_mask = df['is_rth']
-        session_date = df.index.date
+        # P5-F: Use Numba-accelerated loop (or pure Python fallback)
+        rth_mask_arr = df['is_rth'].values.astype(np.bool_)
+        # Encode dates as integer IDs for Numba compatibility
+        dates = df.index.date
+        unique_dates = {d: i for i, d in enumerate(sorted(set(dates)))}
+        date_ids = np.array([unique_dates[d] for d in dates], dtype=np.int64)
 
-        cusum_pos = pd.Series(0.0, index=df.index)
-        cusum_neg = pd.Series(0.0, index=df.index)
-
-        prev_date = None
-        running_pos = 0.0
-        running_neg = 0.0
-
-        for i in range(len(df)):
-            if not rth_mask.iloc[i]:
-                cusum_pos.iloc[i] = 0.0
-                cusum_neg.iloc[i] = 0.0
-                continue
-
-            current_date = session_date[i]
-            if current_date != prev_date:
-                # New session: reset
-                running_pos = 0.0
-                running_neg = 0.0
-                prev_date = current_date
-
-            r = log_ret.iloc[i] if not np.isnan(log_ret.iloc[i]) else 0.0
-            # Convert log return to points for comparison with ATR threshold
-            r_points = r * df['close'].iloc[i]
-
-            running_pos = max(0.0, running_pos + r_points)
-            running_neg = min(0.0, running_neg + r_points)
-
-            cusum_pos.iloc[i] = running_pos
-            cusum_neg.iloc[i] = running_neg
-
-        df['cusum_pos'] = cusum_pos
-        df['cusum_neg'] = cusum_neg
+        cusum_pos_arr, cusum_neg_arr = _cusum_session_loop(
+            log_ret.values.astype(np.float64),
+            df['close'].values.astype(np.float64),
+            rth_mask_arr, date_ids, len(df),
+        )
+        df['cusum_pos'] = cusum_pos_arr
+        df['cusum_neg'] = cusum_neg_arr
 
     else:
         # Rolling: never reset (standard CUSUM)
-        r_points = log_ret * df['close']
-        r_points = r_points.fillna(0)
-
-        cusum_pos = pd.Series(0.0, index=df.index)
-        cusum_neg = pd.Series(0.0, index=df.index)
-        for i in range(1, len(df)):
-            cusum_pos.iloc[i] = max(0.0, cusum_pos.iloc[i-1] + r_points.iloc[i])
-            cusum_neg.iloc[i] = min(0.0, cusum_neg.iloc[i-1] + r_points.iloc[i])
-
-        df['cusum_pos'] = cusum_pos
-        df['cusum_neg'] = cusum_neg
+        # P5-F: Use Numba-accelerated loop (or pure Python fallback)
+        r_points = (log_ret * df['close']).fillna(0)
+        cusum_pos_arr, cusum_neg_arr = _cusum_rolling_loop(
+            r_points.values.astype(np.float64), len(df),
+        )
+        df['cusum_pos'] = cusum_pos_arr
+        df['cusum_neg'] = cusum_neg_arr
 
     # --- Event detection ---
     time_ok = (

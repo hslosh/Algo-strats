@@ -107,14 +107,7 @@ def add_volatility_features(df: pd.DataFrame, windows: list[int] = None) -> pd.D
     return df
 
 
-def _true_range(df: pd.DataFrame) -> pd.Series:
-    """True Range = max(H-L, |H-prevC|, |L-prevC|)."""
-    prev_close = df["close"].shift(1)
-    return pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
+from research_utils.utils import true_range as _true_range
 
 
 # ---------------------------------------------------------------------------
@@ -408,13 +401,7 @@ def add_cross_timeframe_features(
     return df_out
 
 
-def _true_range_from_df(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    return pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
+_true_range_from_df = _true_range  # Alias for backward compatibility
 
 
 # ---------------------------------------------------------------------------

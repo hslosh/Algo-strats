@@ -4,6 +4,22 @@
 // Use on: NQ1! (NQ continuous) — 5-minute chart
 // TradingView strategy() — equity curve, drawdown, trade list, metrics.
 //
+// IMPORTANT: This Pine Script implements a HEURISTIC approximation of the
+// strategy concept using 10 scoring rules (0–100 composite score). It is NOT
+// equivalent to the Python ML pipeline which uses a 62-feature LightGBM model
+// with walk-forward optimization and Platt-scaled probabilities.
+//
+// Performance metrics shown in this script are for the PINE heuristic only:
+//   137 trades, 70.8% WR, PF 2.41x, max DD -$2,156 (TradingView backtest)
+//
+// Python ML pipeline metrics (post-fix, to be updated after pipeline re-run):
+//   [re-run pipeline and fill in computed numbers here]
+//
+// Features unique to Pine script NOT yet in Python:
+//   - Trailing stop (0.5xATR activation, 0.75xATR trail)
+//   - 2-bar entry delay (i_delay_bars = 2)
+// These should be added to the Python backtest (see P2-A).
+//
 // ═══════════════════════════════════════════════════════════════════════
 // 8-STEP INSTITUTIONAL QUANTITATIVE RESEARCH FRAMEWORK
 // ═══════════════════════════════════════════════════════════════════════

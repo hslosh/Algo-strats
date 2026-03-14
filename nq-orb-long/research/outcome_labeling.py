@@ -516,14 +516,7 @@ def print_label_summary(labeled_df: pd.DataFrame, event_name: str = "Event"):
 # UTILITIES
 # ===========================================================================
 
-def _true_range(df: pd.DataFrame) -> pd.Series:
-    """True Range = max(H-L, |H-prevC|, |L-prevC|)."""
-    prev_close = df['close'].shift(1)
-    return pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - prev_close).abs(),
-        (df['low'] - prev_close).abs()
-    ], axis=1).max(axis=1)
+from research_utils.utils import true_range as _true_range
 
 
 # ===========================================================================

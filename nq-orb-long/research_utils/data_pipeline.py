@@ -38,7 +38,7 @@ class DataLoader:
     - No gaps >10 minutes during RTH (09:30-16:00 ET)
     """
     
-    def __init__(self, instrument='NQ', tick_size=0.25, multiplier=20, commission_per_round_trip=12.50):
+    def __init__(self, instrument='NQ', tick_size=0.25, multiplier=20, commission_per_round_trip=9.00):
         """
         Initialize data loader for a specific futures instrument.
         

@@ -668,11 +668,6 @@ def run_full_step7(verbose: bool = True) -> dict:
     dataset = build_model_dataset(df, 'event_orb_long', 'long',
                                    event_type='orb')
 
-    # ── Feature selection ──
-    print("[FEATURES] Selecting features...")
-    feature_cols = select_features(dataset, verbose=False)
-    print(f"  {len(feature_cols)} features selected")
-
     # ── P2-B: Split into WFO pool and holdout BEFORE model training ──
     HOLDOUT_START_DATE = pd.Timestamp('2025-07-01', tz='America/New_York')
     wfo_dataset = dataset[dataset.index < HOLDOUT_START_DATE].copy()
@@ -680,13 +675,15 @@ def run_full_step7(verbose: bool = True) -> dict:
     print(f"[SPLIT] WFO pool: {len(wfo_dataset)} events  |  "
           f"Holdout (>= {HOLDOUT_START_DATE.date()}): {len(holdout_dataset)} events")
 
-    # ── Generate OOS predictions on WFO pool ONLY ──
+    # ── Generate OOS predictions (P4-B: per-fold feature selection) ──
     print("[MODEL] Generating walk-forward OOS predictions (WFO pool only)...")
-    oos_df = generate_oos_predictions(
-        wfo_dataset, feature_cols, model_type='logistic',
+    print("  (feature selection runs per-fold on training data only)")
+    oos_df, feature_cols = generate_oos_predictions(
+        wfo_dataset, feature_cols=None, model_type='logistic',
         min_train_events=200, test_months=6, embargo_days=5,
         verbose=verbose,
     )
+    print(f"  Production feature set: {len(feature_cols)} features")
 
     # ── P2-B: Generate holdout predictions with production model ──
     holdout_oos = pd.DataFrame()
@@ -821,7 +818,7 @@ def run_full_step7(verbose: bool = True) -> dict:
     print("[DONE] Step 7 complete.")
     print()
 
-    return {
+    results = {
         'trades': trades,
         'metrics': metrics,
         'monte_carlo': mc,
@@ -832,6 +829,15 @@ def run_full_step7(verbose: bool = True) -> dict:
         'holdout_oos': holdout_oos,
         'oos_combined': oos_combined,
     }
+
+    # P5-E: Save computed results to disk
+    from research_utils.utils import save_pipeline_results
+    save_metrics = {k: v for k, v in metrics.items()
+                    if not isinstance(v, (pd.DataFrame, pd.Series))}
+    save_metrics['holdout'] = holdout
+    save_pipeline_results(save_metrics, 'step7_backtest')
+
+    return results
 
 
 # =====================================================================

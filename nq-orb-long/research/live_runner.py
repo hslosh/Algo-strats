@@ -42,8 +42,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from research_utils.feature_engineering import load_ohlcv, build_features
-from research.event_features import build_model_dataset, get_feature_columns
-from research.config import CANONICAL_THRESHOLD
+from research.event_features import (
+    build_model_dataset, get_feature_columns, extract_event_features_row,
+)
+from research.config import (
+    CANONICAL_THRESHOLD, MAX_POSITION_BARS, AVOID_LAST_N_MINUTES,
+    DAILY_LOSS_CAP_TICKS, NQ_MULTIPLIER, TICK_SIZE,
+)
 from research.model_design import (
     build_walk_forward_splits,
     train_model,
@@ -257,14 +262,10 @@ class ModelManager:
             else:
                 self.logger.warning("  No events above threshold in calibration fold")
 
-            # 7. Now retrain on ALL data for production
-            self.logger.info("  Retraining final model on ALL data...")
-            X_all = dataset[self.feature_cols].fillna(0)
-            if label_col == 'barrier_label':
-                y_all = (dataset[label_col] == 1).astype(int)
-            else:
-                y_all = dataset[label_col].astype(int)
-            self.model = train_model(X_all, y_all, model_type=self.config.model_type)
+            # Production model: use the model trained on all-but-last-fold.
+            # The calibrator was fitted on THIS model's OOS predictions, so it
+            # remains valid. Retraining on all data would invalidate the calibrator.
+            self.logger.info("  Production model: last WFO fold train model (calibrator valid)")
 
             self.is_ready = True
             self.logger.info("MODEL TRAINING — Complete and ready for live inference")
@@ -398,6 +399,9 @@ class SessionState:
     stop_loss: float = 0.0
     take_profit: float = 0.0
     pending_prob: float = 0.0
+    position_size: int = 0
+    bars_held: int = 0
+    consecutive_losses: int = 0
 
     def reset(self, date_str: str):
         """Reset for new trading day."""
@@ -416,6 +420,9 @@ class SessionState:
         self.stop_loss = 0.0
         self.take_profit = 0.0
         self.pending_prob = 0.0
+        self.position_size = 0
+        self.bars_held = 0
+        self.consecutive_losses = 0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -453,14 +460,20 @@ class BarProcessor:
         date_str = dt.strftime('%Y-%m-%d')
         return date_str != self.state.date and self._is_rth(dt)
 
+    def _eod_flatten_time(self) -> int:
+        """Minutes-from-midnight threshold for EOD flatten (15:30 = 930 min)."""
+        return 960 - AVOID_LAST_N_MINUTES  # 16:00 ET = 960 min
+
     def process_bar(self, bar: Dict):
         """
-        Process a single 5-minute bar.
+        Process a single 5-minute bar. Check exits first, then entries.
         bar should have: datetime, open, high, low, close, volume
         """
         dt = bar['datetime']
         if not self._is_rth(dt):
             return
+
+        bar_minutes = dt.hour * 60 + dt.minute
 
         # New session?
         date_str = dt.strftime('%Y-%m-%d')
@@ -472,6 +485,94 @@ class BarProcessor:
 
         # Check halted
         if self.state.halted:
+            return
+
+        # ══════════════════════════════════════════════════
+        # EXIT CHECK (always runs first when in a trade)
+        # ══════════════════════════════════════════════════
+        if self.state.in_trade:
+            self.state.bars_held += 1
+            exit_reason = None
+            exit_price = None
+
+            low = bar['low']
+            high = bar['high']
+
+            # Stop loss hit (SL takes precedence)
+            if low <= self.state.stop_loss:
+                exit_reason = 'stop_loss'
+                exit_price = self.state.stop_loss  # assume fill at SL level
+            # Take profit hit
+            elif high >= self.state.take_profit:
+                exit_reason = 'take_profit'
+                exit_price = self.state.take_profit
+            # Timeout (MAX_POSITION_BARS)
+            elif self.state.bars_held >= MAX_POSITION_BARS:
+                exit_reason = 'timeout'
+                exit_price = bar['close']
+            # EOD flatten (AVOID_LAST_N_MINUTES before close)
+            elif bar_minutes >= self._eod_flatten_time():
+                exit_reason = 'eod_flatten'
+                exit_price = bar['close']
+
+            if exit_reason is not None:
+                pnl_pts = exit_price - self.state.entry_price
+                pnl_ticks = pnl_pts / TICK_SIZE
+                pnl_dollars = pnl_pts * NQ_MULTIPLIER * self.state.position_size
+
+                self.logger.info(f"[EXIT] {exit_reason} at {exit_price:.2f} "
+                               f"(P&L: {pnl_pts:+.2f} pts, ${pnl_dollars:+,.0f})")
+
+                # Update daily P&L and loss tracking
+                self.state.daily_pnl += pnl_dollars
+                if pnl_pts < 0:
+                    self.state.consecutive_losses += 1
+                else:
+                    self.state.consecutive_losses = 0
+
+                # Emit exit signal
+                exit_signal = {
+                    'action': 'EXIT_LONG',
+                    'symbol': 'NQ',
+                    'date': self.state.date,
+                    'time': dt.strftime('%H:%M:%S'),
+                    'exit_price': round(exit_price, 2),
+                    'entry_price': round(self.state.entry_price, 2),
+                    'reason': exit_reason,
+                    'pnl_pts': round(pnl_pts, 2),
+                    'pnl_dollars': round(pnl_dollars, 2),
+                    'bars_held': self.state.bars_held,
+                }
+                self.signal_logger.emit(exit_signal)
+
+                # Reset trade state
+                self.state.in_trade = False
+                self.state.entry_price = 0.0
+                self.state.stop_loss = 0.0
+                self.state.take_profit = 0.0
+                self.state.position_size = 0
+                self.state.bars_held = 0
+
+                # Check daily loss cap
+                daily_loss_ticks = abs(self.state.daily_pnl) / (TICK_SIZE * NQ_MULTIPLIER)
+                if self.state.daily_pnl < 0 and daily_loss_ticks >= DAILY_LOSS_CAP_TICKS:
+                    self.logger.warning(f"DAILY LOSS CAP HIT ({daily_loss_ticks:.0f} ticks) — halting session")
+                    self.state.halted = True
+
+                # Consecutive loss pause
+                if self.state.consecutive_losses >= 2:
+                    self.logger.warning(f"CONSECUTIVE LOSSES ({self.state.consecutive_losses}) — halting session")
+                    self.state.halted = True
+
+                return  # Do not evaluate entries on exit bar
+
+        # ══════════════════════════════════════════════════
+        # ENTRY LOGIC (only when flat)
+        # ══════════════════════════════════════════════════
+
+        # Check daily loss cap BEFORE entry
+        daily_loss_ticks = abs(self.state.daily_pnl) / (TICK_SIZE * NQ_MULTIPLIER) if self.state.daily_pnl < 0 else 0
+        if daily_loss_ticks >= DAILY_LOSS_CAP_TICKS:
             return
 
         # ── OR Period: Track high/low ──
@@ -544,16 +645,22 @@ class BarProcessor:
 
     def _build_feature_row(self, bar: Dict) -> Optional[pd.DataFrame]:
         """
-        Build a single-row DataFrame with all required features.
-
-        NOTE: This is a placeholder that returns the bar_buffer's last row.
-        For production, you should maintain a rolling DataFrame and call
-        build_model_dataset() or extract_universal_features() incrementally.
+        Build the full feature row for the current ORB event bar.
+        Uses the rolling bar buffer + extract_event_features_row() to compute
+        all 60+ engineered features the model was trained on.
         """
-        if self.bar_buffer is None or len(self.bar_buffer) == 0:
+        if self.bar_buffer is None or len(self.bar_buffer) < 50:
+            self.logger.warning("[FEATURES] Insufficient bar history; need >= 50 bars")
             return None
-        # Return last row as a DataFrame (keeps column names)
-        return self.bar_buffer.iloc[[-1]]
+
+        event_time = pd.Timestamp(bar['datetime'])
+        feature_row = extract_event_features_row(self.bar_buffer.copy(), event_time)
+
+        if feature_row is None:
+            self.logger.warning(f"[FEATURES] Could not build features for {event_time}")
+            return None
+
+        return feature_row
 
     def _execute_entry(self, bar: Dict):
         """Generate and log an entry signal."""
@@ -613,6 +720,8 @@ class BarProcessor:
         self.state.entry_price = entry
         self.state.stop_loss = sl
         self.state.take_profit = tp
+        self.state.position_size = sizing['contracts']
+        self.state.bars_held = 0
 
     def update_bar_buffer(self, df: pd.DataFrame):
         """Update the rolling bar buffer with processed feature data."""
@@ -654,18 +763,34 @@ class IBDataFeed:
             return False
 
     def get_contract(self):
-        """Get the front-month NQ futures contract."""
+        """Resolve the front-month NQ futures contract via reqContractDetails."""
         from ib_insync import Future
-        # Get front month — IB auto-resolves continuous
+        # Create underspecified contract; IB returns all matching
         contract = Future(
-            self.config.ib_symbol,
+            symbol=self.config.ib_symbol,
             exchange=self.config.ib_exchange,
+            currency='USD',
         )
-        contracts = self.ib.reqContractDetails(contract)
-        if contracts:
-            return contracts[0].contract
-        else:
-            self.logger.error("Could not resolve NQ contract")
+        try:
+            details = self.ib.reqContractDetails(contract)
+            if not details:
+                self.logger.error("No contract details returned for NQ CME")
+                return None
+            if len(details) > 1:
+                # Multiple contracts: pick the nearest expiry
+                details.sort(key=lambda d: d.contract.lastTradeDateOrContractMonth)
+                self.logger.info(
+                    f"Multiple NQ contracts found; using nearest expiry: "
+                    f"{details[0].contract.lastTradeDateOrContractMonth}"
+                )
+            qualified = details[0].contract
+            self.logger.info(
+                f"[IB] Resolved NQ contract: {qualified.localSymbol} "
+                f"expiry={qualified.lastTradeDateOrContractMonth}"
+            )
+            return qualified
+        except Exception as e:
+            self.logger.error(f"[IB] Contract resolution failed: {e}")
             return None
 
     def get_historical_bars(self, contract, duration='5 D') -> pd.DataFrame:

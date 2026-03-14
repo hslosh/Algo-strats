@@ -18,7 +18,8 @@ class BacktestRunner:
         self.initial_cash = initial_cash
         self.loader = DataLoader(instrument=instrument)
         self.factory = StrategyFactory()
-        self.commission = 6.25 if instrument == 'NQ' else 1.25
+        from research.config import COMMISSION_PER_SIDE
+        self.commission = COMMISSION_PER_SIDE  # $4.50 per side
 
     def run(self, data_list, params, start_date=None, end_date=None):
         cerebro = bt.Cerebro()
@@ -102,7 +103,7 @@ def main():
         'max_trades_per_day': 3, 'max_position_bars': 12,
         'daily_loss_cap_ticks': 50, 'avoid_first_n_minutes': 5,
         'avoid_last_n_minutes': 30, 'use_trend_filter': False,
-        'tick_value_dollars': 5.0, 'commission_per_trade': 6.25,
+        'tick_value_dollars': 5.0, 'commission_per_trade': 4.50,
     }
     
     runner = BacktestRunner(instrument=args.instrument, initial_cash=args.initial_cash)

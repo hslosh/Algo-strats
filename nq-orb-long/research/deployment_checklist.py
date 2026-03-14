@@ -15,7 +15,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-warnings.filterwarnings('ignore')
+# Suppress only known benign warnings from specific libraries
+warnings.filterwarnings('ignore', category=UserWarning, module='lightgbm')
+warnings.filterwarnings('ignore', category=FutureWarning, module='sklearn')
 
 # ── paths ────────────────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -367,40 +369,39 @@ def generate_monitoring_schedule(verbose: bool = True):
 # Validation Summary Across All 8 Steps
 # ═════════════════════════════════════════════════════════════════════
 
-def print_framework_summary(verbose: bool = True):
-    """Print the 8-step framework completion status."""
+def print_framework_summary(metrics: dict = None, verbose: bool = True):
+    """
+    Print framework summary with actual backtest metrics.
+
+    Parameters
+    ----------
+    metrics : dict from backtest results, expected keys:
+        n_trades, win_rate, annualized_sharpe, max_drawdown_usd,
+        total_return_pct, avg_trade_pnl, profit_factor, holdout_auc
+    verbose : if False, skip output entirely
+    """
     if not verbose:
         return
 
     print("\n" + "=" * 70)
-    print("  8-STEP RESEARCH FRAMEWORK — COMPLETION STATUS")
+    print("  NQ ORB ML STRATEGY — FRAMEWORK SUMMARY")
     print("=" * 70)
 
-    steps = [
-        ("Step 1", "Event Definition", "PASS",
-         "10 event types defined, ORB Long selected as primary"),
-        ("Step 2", "Outcome Labeling", "PASS",
-         "Double-barrier: 1.0x ATR SL, 1.5x ATR TP, 63% base WR"),
-        ("Step 3", "Feature Engineering", "PASS",
-         "62 features extracted, 20 selected after filtering"),
-        ("Step 4", "Statistical Research", "PASS",
-         "12 features significant (p<0.01), passes shuffled-label test"),
-        ("Step 5", "Model Design", "PASS",
-         "AUC=0.80, calibrated OOS predictions, walk-forward validated"),
-        ("Step 6", "Strategy Construction", "PASS",
-         "Threshold 0.58 optimal, confidence sizing, circuit breaker"),
-        ("Step 7", "Backtest Validation", "PASS",
-         "100 trades, 73% WR, Sharpe 10.65, DD -$2,661, holdout +$9k"),
-        ("Step 8", "Deployment Checklist", "PASS",
-         "Pre-flight checks, paper protocol, monitoring schedule"),
-    ]
+    if metrics is None:
+        print("  [WARNING] No metrics provided. Run the backtest pipeline first.")
+        print("            Call print_framework_summary(metrics=result_dict)")
+        print("=" * 70)
+        return
 
-    for step, name, status, detail in steps:
-        icon = "✓" if status == "PASS" else "✗"
-        print(f"  {icon} {step}: {name:30s} [{status}]")
-        print(f"         {detail}")
-
-    print(f"\n  >>> ALL 8 STEPS COMPLETE — STRATEGY READY FOR PAPER TRADING <<<")
+    print(f"  Trades (OOS):        {metrics.get('n_trades', 'N/A')}")
+    print(f"  Win Rate:            {metrics.get('win_rate', 0):.1%}")
+    print(f"  Annualized Sharpe:   {metrics.get('annualized_sharpe', 0):.2f}")
+    print(f"  Max Drawdown:        ${metrics.get('max_drawdown_usd', 0):,.0f}")
+    print(f"  Avg Trade P&L:       ${metrics.get('avg_trade_pnl', 0):.2f}")
+    print(f"  Profit Factor:       {metrics.get('profit_factor', 0):.2f}x")
+    print(f"  Holdout AUC:         {metrics.get('holdout_auc', 0):.4f}")
+    print(f"  Total Return (OOS):  {metrics.get('total_return_pct', 0):+.1f}%")
+    print("=" * 70)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -437,9 +438,11 @@ def run_full_step8(verbose: bool = True) -> Dict:
     # ── Pre-flight checks ────────────────────────────────────────
     preflight = run_preflight_checks(df, dataset, feature_cols, verbose=verbose)
 
-    # ── Generate OOS predictions ─────────────────────────────────
+    # ── Generate OOS predictions (P4-B: per-fold feature selection) ──
     print("\n[MODEL] Generating walk-forward OOS predictions...")
-    oos_preds = generate_oos_predictions(dataset, feature_cols)
+    print("  (feature selection runs per-fold on training data only)")
+    oos_preds, feature_cols = generate_oos_predictions(
+        dataset, feature_cols=None)
     print(f"  {len(oos_preds)} OOS predictions, mean P(win) = {oos_preds['calibrated_prob'].mean():.3f}")
 
     # ── Run backtest with costs ──────────────────────────────────
@@ -547,9 +550,9 @@ def run_full_step8(verbose: bool = True) -> Dict:
             print(f"  >>> NOT APPROVED — Failed: {', '.join(failed)} <<<")
 
     # Print framework summary
-    print_framework_summary(verbose=verbose)
+    print_framework_summary(metrics=metrics, verbose=verbose)
 
-    return {
+    results = {
         'spec': spec,
         'preflight': preflight,
         'metrics': metrics,
@@ -558,6 +561,16 @@ def run_full_step8(verbose: bool = True) -> Dict:
         'verdict_checks': verdict_checks,
         'verdict': 'PASS' if all_pass else 'FAIL',
     }
+
+    # P5-E: Save computed results to disk
+    from research_utils.utils import save_pipeline_results
+    save_metrics = {k: v for k, v in metrics.items()
+                    if not isinstance(v, (pd.DataFrame, pd.Series))}
+    save_metrics['verdict'] = results['verdict']
+    save_metrics['verdict_checks'] = verdict_checks
+    save_pipeline_results(save_metrics, 'step8_deploy')
+
+    return results
 
 
 # ═════════════════════════════════════════════════════════════════════

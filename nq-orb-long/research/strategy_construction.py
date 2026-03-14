@@ -716,18 +716,37 @@ def print_threshold_sensitivity(sens_df: pd.DataFrame):
 # =====================================================================
 
 def generate_oos_predictions(dataset: pd.DataFrame,
-                              feature_cols: list,
+                              feature_cols: list = None,
                               model_type: str = 'logistic',
                               min_train_events: int = 200,
                               test_months: int = 6,
                               embargo_days: int = 5,
-                              verbose: bool = True) -> pd.DataFrame:
+                              verbose: bool = True) -> tuple:
     """
     Re-run walk-forward to produce OOS calibrated probabilities
     for every event that falls in a test fold.
 
-    Returns the dataset augmented with 'raw_prob' and 'calibrated_prob'.
+    Parameters
+    ----------
+    dataset : DataFrame with features and barrier_label
+    feature_cols : list or None
+        If None, feature selection is run per-fold on training data only
+        (P4-B fix: prevents selection bias from using OOS data).
+        If provided, uses these features for all folds (legacy behavior).
+    model_type : str
+    min_train_events, test_months, embargo_days : WFO parameters
+    verbose : bool
+
+    Returns
+    -------
+    tuple of (oos_df, production_features)
+        oos_df : DataFrame augmented with 'raw_prob' and 'calibrated_prob'
+        production_features : list of feature column names for the production
+            model (union of features selected in >=50% of folds, or the
+            original feature_cols if provided).
     """
+    from collections import Counter
+
     # Prepare labels
     ds, labels = prepare_labels(dataset, label_col='barrier_label',
                                 return_col='barrier_return_pts',
@@ -742,23 +761,36 @@ def generate_oos_predictions(dataset: pd.DataFrame,
         print(f"  Walk-forward: {len(splits)} folds, "
               f"{sum(len(s['test_idx']) for s in splits)} total OOS events")
 
+    per_fold_selection = feature_cols is None
+
     # Collect OOS predictions with forward-only calibration (P1-B fix)
     all_cal_probs = []
     all_raw_probs = []
     all_indices = []
     all_true_labels = []
     fold_results = []  # store per-fold for forward calibration
+    fold_selected_features = []  # P4-B: track per-fold feature sets
 
-    X = ds[feature_cols]
     y = labels
 
     for fold_i, split in enumerate(splits):
         train_idx = split['train_idx']
         test_idx = split['test_idx']
 
-        X_train = X.loc[train_idx]
+        # P4-B: Per-fold feature selection on training data only
+        if per_fold_selection:
+            fold_features = select_features(
+                ds.loc[train_idx], verbose=False,
+            )
+            fold_selected_features.append(fold_features)
+            if verbose:
+                print(f"    Fold {fold_i}: {len(fold_features)} features selected")
+        else:
+            fold_features = feature_cols
+
+        X_train = ds.loc[train_idx, fold_features]
         y_train = y.loc[train_idx]
-        X_test = X.loc[test_idx]
+        X_test = ds.loc[test_idx, fold_features]
 
         model = train_model(X_train, y_train, model_type=model_type)
         fold_probs = predict_proba(model, X_test, model_type=model_type)
@@ -769,7 +801,7 @@ def generate_oos_predictions(dataset: pd.DataFrame,
             # No prior OOS data; calibrate on chronological tail of training set
             n_cal = max(len(train_idx) // 2, 20)
             cal_idx = train_idx[-n_cal:]
-            X_cal = X.loc[cal_idx]
+            X_cal = ds.loc[cal_idx, fold_features]
             y_cal = y.loc[cal_idx]
             cal_raw = predict_proba(model, X_cal, model_type=model_type)
             calibrator = calibrate_probabilities(cal_raw, y_cal.values, method='isotonic')
@@ -798,11 +830,25 @@ def generate_oos_predictions(dataset: pd.DataFrame,
     oos_df['raw_prob'] = raw_probs
     oos_df['calibrated_prob'] = cal_probs
 
+    # P4-B: Compute production feature set
+    if per_fold_selection and fold_selected_features:
+        feature_counts = Counter(f for fs in fold_selected_features for f in fs)
+        n_folds = len(splits)
+        production_features = sorted([
+            f for f, count in feature_counts.items()
+            if count >= n_folds * 0.50
+        ])
+        if verbose:
+            print(f"  Production feature set: {len(production_features)} features "
+                  f"(union of >=50% fold selections from {n_folds} folds)")
+    else:
+        production_features = feature_cols
+
     if verbose:
         print(f"  OOS predictions: {len(oos_df)} events, "
               f"mean P(win) = {cal_probs.mean():.3f}")
 
-    return oos_df
+    return oos_df, production_features
 
 
 # =====================================================================
@@ -854,15 +900,12 @@ def run_full_step6(df: pd.DataFrame,
     dataset = build_model_dataset(df, 'event_orb_long', 'long',
                                    event_type='orb')
 
-    # ── Feature selection ──
-    print("[FEATURES] Selecting features...")
-    feature_cols = select_features(dataset, verbose=verbose)
-
-    # ── Generate OOS predictions ──
+    # ── Generate OOS predictions (P4-B: per-fold feature selection) ──
     print()
     print("[MODEL] Generating walk-forward OOS predictions...")
-    oos_df = generate_oos_predictions(
-        dataset, feature_cols, model_type='logistic',
+    print("  (feature selection runs per-fold on training data only)")
+    oos_df, feature_cols = generate_oos_predictions(
+        dataset, feature_cols=None, model_type='logistic',
         min_train_events=200, test_months=6, embargo_days=5,
         verbose=verbose,
     )
@@ -923,14 +966,23 @@ def run_full_step6(df: pd.DataFrame,
 
     print("[DONE] Step 6 complete.")
 
-    return {
+    results = {
         'oos_df': oos_df,
         'sim': sim,
         'metrics': metrics,
         'monte_carlo': mc,
         'threshold_sensitivity': sens,
         'config': config,
+        'production_features': feature_cols,
     }
+
+    # P5-E: Save computed results to disk
+    from research_utils.utils import save_pipeline_results
+    save_metrics = {k: v for k, v in metrics.items()
+                    if not isinstance(v, (pd.DataFrame, pd.Series))}
+    save_pipeline_results(save_metrics, 'step6_strategy')
+
+    return results
 
 
 # =====================================================================

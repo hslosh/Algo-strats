@@ -716,17 +716,18 @@ def run_model_pipeline(dataset, event_name='Event',
     results['unconditional_ev'] = round(unconditional_ev, 3)
     print(f"  Unconditional EV: {unconditional_ev:+.3f} pts")
 
-    # --- Feature selection ---
-    print(f"\n[2/6] Feature selection...")
+    # --- Feature selection (P4-B: moved inside WFO fold loop) ---
+    print(f"\n[2/6] Feature selection (per-fold on training data only)...")
     if feature_cols is None:
         from event_features import get_feature_columns
         all_features = get_feature_columns(dataset_binary)
     else:
         all_features = feature_cols
 
-    selected = select_features(dataset_binary, feature_cols=all_features, verbose=verbose)
-    results['selected_features'] = selected
-    results['n_features'] = len(selected)
+    # NOTE: select_features is now called per-fold inside the WFO loop below.
+    # This avoids selection bias from using OOS data to influence feature choice.
+    results['initial_feature_pool'] = all_features
+    results['n_initial_features'] = len(all_features)
 
     # --- Walk-forward splits ---
     print(f"\n[3/6] Building walk-forward splits...")
@@ -738,6 +739,27 @@ def run_model_pipeline(dataset, event_name='Event',
     if not splits:
         print("  [ERROR] No valid walk-forward splits. Aborting.")
         return results
+
+    # P4-B: Per-fold feature selection (cached across model types)
+    from collections import Counter
+    fold_feature_sets = []
+    for fold_i, split in enumerate(splits):
+        train_data = dataset_binary.loc[split['train_idx']]
+        fold_feats = select_features(train_data, feature_cols=all_features, verbose=False)
+        fold_feature_sets.append(fold_feats)
+        print(f"    Fold {fold_i}: {len(fold_feats)} features selected on train data")
+
+    # Production feature set: union of features in >=50% of folds
+    feature_counts = Counter(f for fs in fold_feature_sets for f in fs)
+    n_folds = len(splits)
+    selected = sorted([
+        f for f, count in feature_counts.items()
+        if count >= n_folds * 0.50
+    ])
+    print(f"  Production feature set: {len(selected)} features "
+          f"(>=50% of {n_folds} folds)")
+    results['selected_features'] = selected
+    results['n_features'] = len(selected)
 
     # --- Walk-forward training ---
     print(f"\n[4/6] Walk-forward model training...")
@@ -751,7 +773,7 @@ def run_model_pipeline(dataset, event_name='Event',
         oos_records = []
         fold_importances = []
 
-        for split in splits:
+        for fold_i, split in enumerate(splits):
             # Train/test data
             train_data = dataset_binary.loc[split['train_idx']]
             test_data = dataset_binary.loc[split['test_idx']]
@@ -759,8 +781,10 @@ def run_model_pipeline(dataset, event_name='Event',
             _, y_train = prepare_labels(train_data, timeout_treatment=timeout_treatment)
             _, y_test = prepare_labels(test_data, timeout_treatment=timeout_treatment)
 
-            X_train = train_data.loc[y_train.index, selected]
-            X_test = test_data.loc[y_test.index, selected]
+            # P4-B: Use per-fold feature set (train-only selection)
+            fold_selected = fold_feature_sets[fold_i]
+            X_train = train_data.loc[y_train.index, fold_selected]
+            X_test = test_data.loc[y_test.index, fold_selected]
 
             # Handle edge cases
             if len(y_train) < 50 or len(y_test) < 5:
@@ -774,8 +798,8 @@ def run_model_pipeline(dataset, event_name='Event',
             # Predict
             probs = predict_proba(model, X_test, model_type=mt)
 
-            # Feature importance
-            imp = get_feature_importance(model, selected, model_type=mt)
+            # Feature importance (use this fold's feature set)
+            imp = get_feature_importance(model, fold_selected, model_type=mt)
             fold_importances.append(imp)
 
             # Get returns for test events

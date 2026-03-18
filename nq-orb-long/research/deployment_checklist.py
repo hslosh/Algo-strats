@@ -73,9 +73,9 @@ class StrategySpec:
 
     # Sizing tiers
     size_tiers: list = field(default_factory=lambda: [
-        (0.58, 0.64, 0.6),   # conservative
-        (0.65, 0.74, 0.85),  # standard
-        (0.75, 1.00, 1.0),   # aggressive
+        (CANONICAL_THRESHOLD, 0.64, 0.6),   # conservative
+        (0.65, 0.74, 0.85),                 # standard
+        (0.75, 1.00, 1.0),                  # aggressive
     ])
 
 

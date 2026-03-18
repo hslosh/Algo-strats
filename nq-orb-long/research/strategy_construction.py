@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from research.config import CANONICAL_THRESHOLD
+from research.config import CANONICAL_THRESHOLD, COMMISSION_PER_SIDE, is_high_impact_day
 from research.event_features import build_model_dataset
 from research.model_design import (
     select_features, build_walk_forward_splits, prepare_labels,
@@ -159,8 +159,10 @@ def simulate_strategy(oos_events: pd.DataFrame,
     daily_pnl = {}       # date -> cumulative P&L for the day
     daily_trade_count = {}
     consec_losses = 0
+    daily_halted_dates = set()  # P4-C: dates halted due to consecutive losses
     circuit_breaker_until = None
     weekly_reduced = False
+    prev_date = None
 
     for idx, row in events.iterrows():
         event_date = row['session_date'] if 'session_date' in row.index else idx.date()
@@ -174,6 +176,11 @@ def simulate_strategy(oos_events: pd.DataFrame,
             # Weekly reset check (Monday)
             if hasattr(event_date, 'weekday') and event_date.weekday() == 0:
                 weekly_reduced = False
+
+        # P4-C: Reset consecutive losses at start of each new date
+        if event_date != prev_date:
+            consec_losses = 0
+            prev_date = event_date
 
         # ── Risk checks ──
 
@@ -198,17 +205,33 @@ def simulate_strategy(oos_events: pd.DataFrame,
                 circuit_breaker_until = None
             continue
 
-        # Daily loss limit
-        if daily_pnl[event_date] <= config.max_daily_loss:
+        # P4-C: Skip entire day if halted due to consecutive losses
+        if event_date in daily_halted_dates:
+            continue
+
+        # Phase 2: Regime filter — skip if bear regime
+        if 'regime_long_allowed' in row.index and not row.get('regime_long_allowed', True):
+            continue
+
+        # Phase 3: FOMC filter — skip high-impact days
+        if is_high_impact_day(event_date):
+            continue
+
+        # P4-D: Daily loss limit — check BEFORE entry with worst-case estimate
+        # Worst case = full SL hit + round-trip commission
+        sl_dist_est = abs(row.get('sl_distance_pts', 0))
+        worst_case_pnl = -(sl_dist_est * config.point_value
+                           + COMMISSION_PER_SIDE * 2) if sl_dist_est > 0 else config.max_daily_loss
+        if daily_pnl[event_date] + worst_case_pnl <= config.max_daily_loss:
             continue
 
         # Daily trade count
         if daily_trade_count[event_date] >= config.max_daily_trades:
             continue
 
-        # Consecutive loss pause
+        # P4-C: Consecutive loss pause — halt for the rest of this calendar date
         if consec_losses >= config.consec_loss_pause:
-            consec_losses = 0  # reset after skipping one
+            daily_halted_dates.add(event_date)
             continue
 
         # ── Threshold check ──
@@ -871,7 +894,7 @@ def run_full_step6(df: pd.DataFrame,
     Parameters
     ----------
     df : DataFrame with OHLCV + features + events (output of Steps 1-3)
-    threshold : float, default 0.42
+    threshold : float, default CANONICAL_THRESHOLD (0.58)
     verbose : bool
 
     Returns

@@ -18,7 +18,7 @@ All features use ONLY data available at or before the event bar (no look-ahead).
 Usage:
     from event_features import build_model_dataset, build_feature_matrix
     from event_definitions import detect_all_events, add_session_columns
-    from outcome_labeling import label_event_full
+    from research.outcome_labeling import label_event_full
     from feature_engineering import load_ohlcv, build_features
 
     # Load and prepare data
@@ -642,7 +642,7 @@ def build_model_dataset(
     DataFrame ready for model training: features + labels
     """
     # Import here to avoid circular dependency
-    from outcome_labeling import label_event_full
+    from research.outcome_labeling import label_event_full
 
     # Step 2: Label events
     labeled = label_event_full(
@@ -771,7 +771,7 @@ if __name__ == '__main__':
 
     from feature_engineering import load_ohlcv, build_features
     from event_definitions import add_session_columns, detect_session_sweep, detect_orb
-    from outcome_labeling import label_event_full, print_label_summary
+    from research.outcome_labeling import label_event_full, print_label_summary
 
     print("=" * 70)
     print("EVENT FEATURES — Validation Run")

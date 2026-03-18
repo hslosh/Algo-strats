@@ -54,7 +54,7 @@ def select_features(dataset, feature_cols=None, max_nan_pct=0.30,
     list of selected feature column names
     """
     if feature_cols is None:
-        from event_features import get_feature_columns
+        from research.event_features import get_feature_columns
         feature_cols = get_feature_columns(dataset)
 
     if verbose:
@@ -460,7 +460,8 @@ def print_calibration_table(calibrated_probs, true_labels, n_bins=8):
 # ===========================================================================
 
 def optimize_threshold(calibrated_probs, returns, labels,
-                       min_trades_per_year=30, years=7.0):
+                       min_trades_per_year=30, years=7.0,
+                       timestamps=None):
     """
     Sweep threshold to find optimal trade/no-trade cutoff.
 
@@ -492,8 +493,14 @@ def optimize_threshold(calibrated_probs, returns, labels,
         losses = filtered_returns[filtered_returns < 0]
         pf = abs(wins.sum() / losses.sum()) if losses.sum() != 0 else 999
 
-        # Sharpe
-        sharpe = ev / std * np.sqrt(252) if std > 0 else 0
+        # Sharpe — daily P&L annualized if timestamps available, else trade-level approx
+        if timestamps is not None:
+            import pandas as pd
+            filt_ts = pd.to_datetime(timestamps[mask])
+            daily_pnl = pd.Series(filtered_returns, index=filt_ts).groupby(filt_ts.normalize()).sum()
+            sharpe = (daily_pnl.mean() / daily_pnl.std()) * np.sqrt(252) if daily_pnl.std() > 0 else 0
+        else:
+            sharpe = ev / std * np.sqrt(252) if std > 0 else 0
 
         # Utility: EV * sqrt(N) — balances quality and frequency
         utility = ev * np.sqrt(n)
@@ -606,6 +613,7 @@ def evaluate_model(oos_df, unconditional_ev, unconditional_n, years=7.0):
     # Threshold-filtered results
     thresh_df, best_thresh = optimize_threshold(
         cal_p, returns, y, years=years,
+        timestamps=oos_df.index,
     )
     metrics['best_threshold'] = best_thresh
     metrics['threshold_df'] = thresh_df
@@ -719,7 +727,7 @@ def run_model_pipeline(dataset, event_name='Event',
     # --- Feature selection (P4-B: moved inside WFO fold loop) ---
     print(f"\n[2/6] Feature selection (per-fold on training data only)...")
     if feature_cols is None:
-        from event_features import get_feature_columns
+        from research.event_features import get_feature_columns
         all_features = get_feature_columns(dataset_binary)
     else:
         all_features = feature_cols

@@ -47,7 +47,7 @@ from research.event_features import (
 )
 from research.config import (
     CANONICAL_THRESHOLD, MAX_POSITION_BARS, AVOID_LAST_N_MINUTES,
-    DAILY_LOSS_CAP_TICKS, NQ_MULTIPLIER, TICK_SIZE,
+    DAILY_LOSS_CAP_TICKS, NQ_MULTIPLIER, TICK_SIZE, is_high_impact_day,
 )
 from research.model_design import (
     build_walk_forward_splits,
@@ -80,7 +80,8 @@ class LiveConfig:
     max_daily_loss: float = -1_000.0
     max_daily_trades: int = 3
     slippage_pts: float = 0.50
-    commission_rt: float = 4.50
+    commission_per_side: float = 0.62  # per contract per fill (MNQ rate)
+    point_value: float = 2.0           # MNQ dollars per point
 
     # Position sizing tiers
     tier_conservative: Tuple[float, float] = (0.58, 0.65)
@@ -96,7 +97,7 @@ class LiveConfig:
     ib_host: str = '127.0.0.1'
     ib_port: int = 7497          # 7497=TWS paper, 4002=Gateway paper
     ib_client_id: int = 10
-    ib_symbol: str = 'NQ'
+    ib_symbol: str = 'MNQ'
     ib_exchange: str = 'CME'
 
     # Data
@@ -360,9 +361,8 @@ def compute_position_size(config: LiveConfig, prob: float, sl_pts: float) -> Dic
     multiplier = config.tier_multipliers[tier]
     risk_dollars = config.account_size * (config.risk_per_trade_pct / 100.0)
 
-    # NQ point value = $20/point
     if sl_pts > 0:
-        raw_contracts = risk_dollars / (sl_pts * 20)
+        raw_contracts = risk_dollars / (sl_pts * NQ_MULTIPLIER)
     else:
         raw_contracts = 1
 
@@ -483,6 +483,11 @@ class BarProcessor:
             self.logger.info(f"{'='*50}")
             self.state.reset(date_str)
 
+            # FOMC filter — halt on high-impact days
+            if is_high_impact_day(dt):
+                self.logger.info(f"[FOMC] High-impact day {date_str} — halting session")
+                self.state.halted = True
+
         # Check halted
         if self.state.halted:
             return
@@ -533,7 +538,7 @@ class BarProcessor:
                 # Emit exit signal
                 exit_signal = {
                     'action': 'EXIT_LONG',
-                    'symbol': 'NQ',
+                    'symbol': self.config.ib_symbol,
                     'date': self.state.date,
                     'time': dt.strftime('%H:%M:%S'),
                     'exit_price': round(exit_price, 2),
@@ -560,7 +565,7 @@ class BarProcessor:
                     self.state.halted = True
 
                 # Consecutive loss pause
-                if self.state.consecutive_losses >= 2:
+                if self.state.consecutive_losses >= 3:
                     self.logger.warning(f"CONSECUTIVE LOSSES ({self.state.consecutive_losses}) — halting session")
                     self.state.halted = True
 
@@ -688,7 +693,7 @@ class BarProcessor:
 
         signal = {
             'action': 'ENTRY_LONG',
-            'symbol': 'NQ',
+            'symbol': self.config.ib_symbol,
             'date': self.state.date,
             'time': bar['datetime'].strftime('%H:%M:%S'),
             'entry_price': round(entry, 2),

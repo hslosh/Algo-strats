@@ -476,6 +476,43 @@ def build_features(
 
 
 # ---------------------------------------------------------------------------
+# TREND REGIME FILTER
+# ---------------------------------------------------------------------------
+
+def add_trend_regime(df: pd.DataFrame, ema_period: int = 50) -> pd.DataFrame:
+    """Add regime_long_allowed column based on prior day's close vs daily EMA.
+
+    Uses RTH close (last bar 15:55-16:00 ET) to compute daily close.
+    shift(1) ensures we use prior day's value (no lookahead).
+    First day defaults to True (permissive).
+    """
+    rth_mask = df.index.hour * 60 + df.index.minute
+    # RTH = 09:30 to 15:55 (last bar before 16:00)
+    is_rth = (rth_mask >= 570) & (rth_mask < 960)  # 9*60+30=570, 16*60=960
+
+    rth_df = df.loc[is_rth].copy()
+    # Daily close = last RTH bar's close per date
+    daily_close = rth_df.groupby(rth_df.index.date)['close'].last()
+    daily_close = daily_close.sort_index()
+
+    # Compute EMA on daily close
+    daily_ema = daily_close.ewm(span=ema_period, adjust=False).mean()
+
+    # Regime: close > EMA, shifted by 1 day (use prior day's value)
+    regime_signal = (daily_close > daily_ema).shift(1)
+
+    # Map back to 5-min bars by date
+    date_to_regime = regime_signal.to_dict()
+    df['regime_long_allowed'] = df.index.date
+    df['regime_long_allowed'] = df['regime_long_allowed'].map(date_to_regime)
+
+    # First day (no prior) defaults to True
+    df['regime_long_allowed'] = df['regime_long_allowed'].fillna(True).astype(bool)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # DATA LOADING HELPERS
 # ---------------------------------------------------------------------------
 

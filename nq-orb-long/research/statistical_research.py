@@ -773,10 +773,11 @@ def run_full_analysis(
         return results
 
     returns = dataset['barrier_return_pts'].values
+    timestamps = dataset.index  # pass event timestamps for daily Sharpe
 
     # 1. Bootstrap CI
     print(f"\n[1/5] Bootstrap confidence intervals...")
-    boot = bootstrap_ev(returns)
+    boot = bootstrap_ev(returns, timestamps=timestamps)
     print_bootstrap_summary(boot, event_name)
     results['bootstrap'] = boot
 

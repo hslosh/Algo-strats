@@ -21,6 +21,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.dirname(__file__))  # allow bare imports from research/
 
 from research.event_features import build_model_dataset, get_feature_columns
 from research.model_design import (
@@ -28,7 +29,7 @@ from research.model_design import (
     train_model, predict_proba, calibrate_probabilities,
     apply_calibration,
 )
-from research.config import CANONICAL_THRESHOLD
+from research.config import CANONICAL_THRESHOLD, TICK_SIZE, is_high_impact_day
 from research.strategy_construction import (
     StrategyConfig, compute_position_size, get_size_multiplier,
     compute_performance_metrics, monte_carlo_drawdown,
@@ -69,6 +70,11 @@ class BacktestConfig:
     max_daily_trades: int = 3
     consec_loss_pause: int = 3
     max_drawdown: float = -2_500.0
+
+    # Trailing stop
+    use_trailing_stop: bool = False
+    trail_activation_mult: float = 0.5   # activate after 0.5×ATR profit
+    trail_distance_mult: float = 0.75    # trail 0.75×ATR behind running high
 
     def __post_init__(self):
         if not self.size_tiers:
@@ -130,7 +136,7 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
     -------
     dict with trades (DataFrame), daily_pnl (Series), final_equity (float), config
     """
-    tick = 0.25                        # NQ tick size in index points
+    tick = TICK_SIZE                    # NQ tick size in index points
     slippage_pts = config.slippage_pts  # default 0.50 pts per side
 
     # Sort predictions chronologically
@@ -175,6 +181,9 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
     entry_bar_idx = None
     bars_held = 0
     position_info = {}
+    running_high = 0.0
+    trail_stop = 0.0
+    trail_active = False
 
     skipped_days = set()
     eod_cutoff = _time_subtract(30)  # 15:30 ET — flatten 30 min before close
@@ -201,11 +210,26 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
             exit_price = None
             exit_reason = None
 
+            # Update trailing stop state
+            if config.use_trailing_stop:
+                running_high = max(running_high, bar['high'])
+                profit_from_entry = running_high - entry_price
+                atr_at_entry = position_info.get('atr_at_entry', 20.0)
+                if profit_from_entry >= config.trail_activation_mult * atr_at_entry:
+                    trail_active = True
+                    new_trail = running_high - config.trail_distance_mult * atr_at_entry
+                    trail_stop = max(trail_stop, new_trail)
+
             # SL hit: bar low penetrates stop loss (long)
             # SL-first on tie: checked before TP
             if bar['low'] <= stop_loss:
                 exit_price = stop_loss - slippage_pts
                 exit_reason = 'stop_loss'
+            # Trailing stop hit (after SL, before TP)
+            elif (config.use_trailing_stop and trail_active
+                  and bar['low'] <= trail_stop):
+                exit_price = trail_stop - slippage_pts
+                exit_reason = 'trailing_stop'
             # TP hit: bar high reaches take profit (long)
             elif bar['high'] >= take_profit:
                 exit_price = take_profit - slippage_pts
@@ -266,6 +290,9 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                 entry_bar_idx = None
                 bars_held = 0
                 position_info = {}
+                running_high = 0.0
+                trail_stop = 0.0
+                trail_active = False
 
         # ==========================================================
         # ENTRY CHECK — only when flat, on pending-entry bars
@@ -308,6 +335,15 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                 consec_losses = 0
                 skip_entry = True
 
+            # Phase 2: Regime filter
+            if not skip_entry and 'regime_long_allowed' in df.columns:
+                if not bar.get('regime_long_allowed', True):
+                    skip_entry = True
+
+            # Phase 3: FOMC filter
+            if not skip_entry and is_high_impact_day(bar_date):
+                skip_entry = True
+
             if not skip_entry:
                 ev_info = pending_entries[i]
 
@@ -339,6 +375,11 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                         in_position = True
                         daily_trade_count[bar_date] += 1
 
+                        # Initialize trailing stop state
+                        running_high = entry_price
+                        trail_stop = 0.0
+                        trail_active = False
+
                         position_info = {
                             'prob': ev_info['prob'],
                             'event_time': ev_info.get('event_time'),
@@ -347,6 +388,7 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                                 strat_config, ev_info['prob']
                             ),
                             'sl_distance_pts': sl_dist,
+                            'atr_at_entry': atr_pts,
                         }
 
     # ── Build output ──
@@ -633,13 +675,14 @@ def print_step7_verdict(metrics: dict, mc: dict, holdout: dict,
 # 7. MASTER PIPELINE
 # =====================================================================
 
-def run_full_step7(verbose: bool = True) -> dict:
+def run_full_step7(verbose: bool = True, use_regime_filter: bool = False) -> dict:
     """
     One-call entry point for Step 7 bar-by-bar backtest.
     """
-    from research_utils.feature_engineering import load_ohlcv, build_features
+    from research_utils.feature_engineering import load_ohlcv, build_features, add_trend_regime
     from research.event_definitions import detect_all_events, add_session_columns
     from research.strategy_construction import generate_oos_predictions
+    from research.config import REGIME_EMA_PERIOD
 
     DATA_PATH = os.path.join(os.path.dirname(__file__),
                              '..', 'nq_continuous_5m_converted.csv')
@@ -659,6 +702,12 @@ def run_full_step7(verbose: bool = True) -> dict:
     df = build_features(df, add_targets_flag=False)
     df = add_session_columns(df)
 
+    if use_regime_filter:
+        print("[REGIME] Adding trend regime filter...")
+        df = add_trend_regime(df, ema_period=REGIME_EMA_PERIOD)
+        regime_days = df.groupby(df.index.date)['regime_long_allowed'].first()
+        print(f"  {regime_days.mean()*100:.1f}% of days are bull regime (trade allowed)")
+
     print("[EVENTS] Detecting events...")
     df = detect_all_events(df)
 
@@ -669,7 +718,7 @@ def run_full_step7(verbose: bool = True) -> dict:
                                    event_type='orb')
 
     # ── P2-B: Split into WFO pool and holdout BEFORE model training ──
-    HOLDOUT_START_DATE = pd.Timestamp('2025-07-01', tz='America/New_York')
+    HOLDOUT_START_DATE = pd.Timestamp('2025-07-01')
     wfo_dataset = dataset[dataset.index < HOLDOUT_START_DATE].copy()
     holdout_dataset = dataset[dataset.index >= HOLDOUT_START_DATE].copy()
     print(f"[SPLIT] WFO pool: {len(wfo_dataset)} events  |  "

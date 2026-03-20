@@ -47,6 +47,7 @@ class BacktestConfig:
 
     # Strategy params
     threshold: float = CANONICAL_THRESHOLD
+    direction: str = 'long'       # 'long' or 'short'
     sl_atr_mult: float = 1.0
     tp_atr_mult: float = 1.5
     max_holding_bars: int = 48
@@ -161,7 +162,7 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                 'prob': prob,
                 'event_time': event_time,
                 'event_row': event_row,
-                'direction': 1,  # long-only strategy
+                'direction': config.direction,
             }
 
     # ── State tracking ──
@@ -182,6 +183,7 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
     bars_held = 0
     position_info = {}
     running_high = 0.0
+    running_low = float('inf')
     trail_stop = 0.0
     trail_active = False
 
@@ -212,27 +214,52 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
 
             # Update trailing stop state
             if config.use_trailing_stop:
-                running_high = max(running_high, bar['high'])
-                profit_from_entry = running_high - entry_price
                 atr_at_entry = position_info.get('atr_at_entry', 20.0)
+                if config.direction == 'long':
+                    running_high = max(running_high, bar['high'])
+                    profit_from_entry = running_high - entry_price
+                else:
+                    running_low = min(running_low, bar['low'])
+                    profit_from_entry = entry_price - running_low
                 if profit_from_entry >= config.trail_activation_mult * atr_at_entry:
                     trail_active = True
-                    new_trail = running_high - config.trail_distance_mult * atr_at_entry
-                    trail_stop = max(trail_stop, new_trail)
+                    if config.direction == 'long':
+                        new_trail = running_high - config.trail_distance_mult * atr_at_entry
+                        trail_stop = max(trail_stop, new_trail)
+                    else:
+                        new_trail = running_low + config.trail_distance_mult * atr_at_entry
+                        trail_stop = min(trail_stop, new_trail)
 
-            # SL hit: bar low penetrates stop loss (long)
+            # Direction-conditional SL/TP checks
             # SL-first on tie: checked before TP
-            if bar['low'] <= stop_loss:
-                exit_price = stop_loss - slippage_pts
+            if config.direction == 'long':
+                sl_hit = bar['low'] <= stop_loss
+                tp_hit = bar['high'] >= take_profit
+                trail_hit = config.use_trailing_stop and trail_active and bar['low'] <= trail_stop
+            else:
+                sl_hit = bar['high'] >= stop_loss
+                tp_hit = bar['low'] <= take_profit
+                trail_hit = config.use_trailing_stop and trail_active and bar['high'] >= trail_stop
+
+            if sl_hit:
+                if config.direction == 'long':
+                    exit_price = stop_loss - slippage_pts
+                else:
+                    exit_price = stop_loss + slippage_pts
                 exit_reason = 'stop_loss'
             # Trailing stop hit (after SL, before TP)
-            elif (config.use_trailing_stop and trail_active
-                  and bar['low'] <= trail_stop):
-                exit_price = trail_stop - slippage_pts
+            elif trail_hit:
+                if config.direction == 'long':
+                    exit_price = trail_stop - slippage_pts
+                else:
+                    exit_price = trail_stop + slippage_pts
                 exit_reason = 'trailing_stop'
-            # TP hit: bar high reaches take profit (long)
-            elif bar['high'] >= take_profit:
-                exit_price = take_profit - slippage_pts
+            # TP hit
+            elif tp_hit:
+                if config.direction == 'long':
+                    exit_price = take_profit - slippage_pts
+                else:
+                    exit_price = take_profit + slippage_pts
                 exit_reason = 'take_profit'
             # Timeout: max bars held
             elif bars_held >= config.max_holding_bars:
@@ -245,7 +272,10 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
 
             if exit_price is not None:
                 contracts = position_info.get('contracts', 1)
-                pnl_pts = exit_price - entry_price
+                if config.direction == 'long':
+                    pnl_pts = exit_price - entry_price
+                else:
+                    pnl_pts = entry_price - exit_price
                 commission = config.commission_per_rt * contracts
                 pnl_dollars = (pnl_pts * config.point_value * contracts
                                - commission)
@@ -291,6 +321,7 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                 bars_held = 0
                 position_info = {}
                 running_high = 0.0
+                running_low = float('inf')
                 trail_stop = 0.0
                 trail_active = False
 
@@ -335,8 +366,8 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                 consec_losses = 0
                 skip_entry = True
 
-            # Phase 2: Regime filter
-            if not skip_entry and 'regime_long_allowed' in df.columns:
+            # Phase 2: Regime filter (direction-aware)
+            if not skip_entry and config.direction == 'long' and 'regime_long_allowed' in df.columns:
                 if not bar.get('regime_long_allowed', True):
                     skip_entry = True
 
@@ -366,9 +397,14 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
                     )
 
                     if contracts > 0:
-                        entry_price = bar['open'] + slippage_pts
-                        stop_loss = entry_price - config.sl_atr_mult * atr_pts
-                        take_profit = entry_price + config.tp_atr_mult * atr_pts
+                        if config.direction == 'long':
+                            entry_price = bar['open'] + slippage_pts
+                            stop_loss = entry_price - config.sl_atr_mult * atr_pts
+                            take_profit = entry_price + config.tp_atr_mult * atr_pts
+                        else:  # short
+                            entry_price = bar['open'] - slippage_pts
+                            stop_loss = entry_price + config.sl_atr_mult * atr_pts
+                            take_profit = entry_price - config.tp_atr_mult * atr_pts
 
                         entry_bar_idx = i
                         bars_held = 0
@@ -377,7 +413,8 @@ def run_bar_by_bar_backtest(df: pd.DataFrame,
 
                         # Initialize trailing stop state
                         running_high = entry_price
-                        trail_stop = 0.0
+                        running_low = entry_price
+                        trail_stop = float('inf') if config.direction == 'short' else 0.0
                         trail_active = False
 
                         position_info = {
@@ -672,12 +709,143 @@ def print_step7_verdict(metrics: dict, mc: dict, holdout: dict,
 
 
 # =====================================================================
-# 7. MASTER PIPELINE
+# 7. PORTFOLIO BACKTEST WRAPPER
 # =====================================================================
 
-def run_full_step7(verbose: bool = True, use_regime_filter: bool = False) -> dict:
+def run_portfolio_backtest(signal_specs: list, verbose: bool = True) -> dict:
+    """
+    Run multiple signal pipelines and merge into a single portfolio.
+
+    Parameters
+    ----------
+    signal_specs : list of dicts
+        Each dict has: {event_col, direction, event_type}
+        Example: [
+            {'event_col': 'event_orb_long',  'direction': 'long',  'event_type': 'orb'},
+            {'event_col': 'event_orb_short', 'direction': 'short', 'event_type': 'orb'},
+        ]
+    verbose : bool
+
+    Returns
+    -------
+    dict with per-signal results, combined trades, portfolio metrics, overlap stats
+    """
+    signal_results = {}
+    all_trades = []
+
+    for spec in signal_specs:
+        key = f"{spec['event_col']}_{spec['direction']}"
+        print(f"\n{'='*72}")
+        print(f"SIGNAL: {key}")
+        print(f"{'='*72}")
+
+        result = run_full_step7(
+            verbose=verbose,
+            event_col=spec['event_col'],
+            direction=spec['direction'],
+            event_type=spec.get('event_type', 'orb'),
+        )
+        signal_results[key] = result
+
+        if not result['trades'].empty:
+            trades = result['trades'].copy()
+            trades['signal_type'] = spec['event_col']
+            trades['direction'] = spec['direction']
+            all_trades.append(trades)
+
+    # Merge all trades
+    if all_trades:
+        combined_trades = pd.concat(all_trades, ignore_index=True)
+        combined_trades = combined_trades.sort_values('entry_time').reset_index(drop=True)
+    else:
+        combined_trades = pd.DataFrame()
+
+    # Trade-day overlap check
+    overlap_stats = {}
+    keys = list(signal_results.keys())
+    for i, key_a in enumerate(keys):
+        trades_a = signal_results[key_a]['trades']
+        if trades_a.empty:
+            continue
+        dates_a = set(pd.to_datetime(trades_a['session_date']).dt.date
+                      if trades_a['session_date'].dtype != 'O'
+                      else trades_a['session_date'])
+        for key_b in keys[i+1:]:
+            trades_b = signal_results[key_b]['trades']
+            if trades_b.empty:
+                continue
+            dates_b = set(pd.to_datetime(trades_b['session_date']).dt.date
+                          if trades_b['session_date'].dtype != 'O'
+                          else trades_b['session_date'])
+            shared = dates_a & dates_b
+            total = dates_a | dates_b
+            pct = len(shared) / len(total) if total else 0
+            overlap_stats[f"{key_a} vs {key_b}"] = {
+                'shared_days': len(shared),
+                'total_days': len(total),
+                'overlap_pct': pct,
+            }
+            print(f"\n[OVERLAP] {key_a} vs {key_b}: "
+                  f"{len(shared)}/{len(total)} days ({pct:.1%})")
+
+    # Portfolio-level metrics
+    portfolio_metrics = {}
+    if not combined_trades.empty:
+        daily_pnl = combined_trades.groupby('session_date')['pnl_dollars'].sum()
+        avg_daily = daily_pnl.mean()
+        std_daily = daily_pnl.std()
+        n_days = len(daily_pnl)
+        years = n_days / 252.0
+        sharpe = (avg_daily / std_daily * np.sqrt(252)) if std_daily > 0 else 0
+        total_pnl = combined_trades['pnl_dollars'].sum()
+        n_trades = len(combined_trades)
+        trades_per_yr = n_trades / years if years > 0 else 0
+        win_rate = (combined_trades['pnl_dollars'] > 0).mean()
+
+        portfolio_metrics = {
+            'n_trades': n_trades,
+            'trades_per_yr': trades_per_yr,
+            'total_pnl': total_pnl,
+            'sharpe': sharpe,
+            'win_rate': win_rate,
+            'n_trading_days': n_days,
+        }
+
+        print(f"\n{'='*72}")
+        print("PORTFOLIO SUMMARY")
+        print(f"{'='*72}")
+        print(f"  Total trades:     {n_trades}")
+        print(f"  Trades/yr:        {trades_per_yr:.1f}")
+        print(f"  Total P&L:        ${total_pnl:>+,.0f}")
+        print(f"  Win rate:         {win_rate:.1%}")
+        print(f"  Daily Sharpe:     {sharpe:.2f}")
+
+    return {
+        'signal_results': signal_results,
+        'combined_trades': combined_trades,
+        'portfolio_metrics': portfolio_metrics,
+        'overlap_stats': overlap_stats,
+    }
+
+
+# =====================================================================
+# 8. MASTER PIPELINE
+# =====================================================================
+
+def run_full_step7(verbose: bool = True, use_regime_filter: bool = False,
+                   event_col: str = 'event_orb_long', direction: str = 'long',
+                   event_type: str = 'orb') -> dict:
     """
     One-call entry point for Step 7 bar-by-bar backtest.
+
+    Parameters
+    ----------
+    event_col : str
+        Column name for event signal (e.g. 'event_orb_long', 'event_orb_short')
+    direction : str
+        'long' or 'short'
+    event_type : str
+        Event type for feature extraction (e.g. 'orb', 'gap', 'exhaustion')
     """
     from research_utils.feature_engineering import load_ohlcv, build_features, add_trend_regime
     from research.event_definitions import detect_all_events, add_session_columns
@@ -713,9 +881,10 @@ def run_full_step7(verbose: bool = True, use_regime_filter: bool = False) -> dic
 
     # ── Build model dataset ──
     print()
-    print("[DATASET] Building ORB Long model dataset...")
-    dataset = build_model_dataset(df, 'event_orb_long', 'long',
-                                   event_type='orb')
+    label = event_col.replace('event_', '').replace('_', ' ').title()
+    print(f"[DATASET] Building {label} model dataset...")
+    dataset = build_model_dataset(df, event_col, direction,
+                                   event_type=event_type)
 
     # ── P2-B: Split into WFO pool and holdout BEFORE model training ──
     HOLDOUT_START_DATE = pd.Timestamp('2025-07-01')
@@ -794,7 +963,7 @@ def run_full_step7(verbose: bool = True, use_regime_filter: bool = False) -> dic
         oos_combined['session_date'] = pd.to_datetime(oos_combined.index).date
 
     # ── Configure backtest ──
-    config = BacktestConfig(threshold=CANONICAL_THRESHOLD)
+    config = BacktestConfig(threshold=CANONICAL_THRESHOLD, direction=direction)
 
     # ── Run bar-by-bar backtest ──
     print()
@@ -821,7 +990,7 @@ def run_full_step7(verbose: bool = True, use_regime_filter: bool = False) -> dic
         ),
     }
     metrics = compute_performance_metrics(sim_result)
-    print_performance_report(metrics, title=f"ORB Long Backtest (th={config.threshold}, with costs)")
+    print_performance_report(metrics, title=f"{label} Backtest (th={config.threshold}, dir={direction}, with costs)")
 
     # ── Cost analysis ──
     print_cost_analysis(trades, config)
@@ -877,6 +1046,7 @@ def run_full_step7(verbose: bool = True, use_regime_filter: bool = False) -> dic
         'oos_df': oos_df,
         'holdout_oos': holdout_oos,
         'oos_combined': oos_combined,
+        'oos_predictions': oos_combined,  # alias for portfolio wrapper
     }
 
     # P5-E: Save computed results to disk

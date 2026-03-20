@@ -66,7 +66,9 @@ from research.model_design import (
 class LiveConfig:
     """All tunable parameters for the live runner."""
     # Strategy
-    threshold: float = CANONICAL_THRESHOLD
+    threshold: float = CANONICAL_THRESHOLD        # alias for execution_threshold
+    execution_threshold: float = CANONICAL_THRESHOLD  # submits orders
+    observation_threshold: float = 0.55              # logs only, no order
     sl_atr_mult: float = 1.0
     tp_atr_mult: float = 1.5
     atr_lookback: int = 14
@@ -334,6 +336,25 @@ class SignalLogger:
             self.logger.info(f"Webhook fired: {resp.status_code}")
         except Exception as e:
             self.logger.warning(f"Webhook failed: {e}")
+
+    def log_observation(self, signal: Dict):
+        """Log signal that met observation threshold but not execution threshold."""
+        signal['timestamp'] = datetime.now().isoformat()
+        signal['status'] = 'observed_only'
+        signal['blocked_by'] = 'below_execution_threshold'
+        try:
+            if os.path.exists(self.config.signal_log):
+                with open(self.config.signal_log, 'r') as f:
+                    signals = json.load(f)
+            else:
+                signals = []
+            signals.append(signal)
+            with open(self.config.signal_log, 'w') as f:
+                json.dump(signals, f, indent=2, default=str)
+            self.logger.info(f"Observation logged (below exec threshold): "
+                           f"prob={signal.get('prob', '?')}")
+        except Exception as e:
+            self.logger.error(f"Failed to log observation: {e}")
 
     def emit(self, signal: Dict):
         """Log + webhook."""
@@ -625,9 +646,10 @@ class BarProcessor:
                 return
 
             self.logger.info(f"  Calibrated P(win): {prob:.3f}  "
-                           f"Threshold: {self.config.threshold:.3f}")
+                           f"Exec threshold: {self.config.execution_threshold:.3f}  "
+                           f"Obs threshold: {self.config.observation_threshold:.3f}")
 
-            if prob >= self.config.threshold:
+            if prob >= self.config.execution_threshold:
                 self.state.pending_prob = prob
                 delay_bars = self.config.delay_minutes // 5
                 if delay_bars > 0:
@@ -637,8 +659,17 @@ class BarProcessor:
                                    f"({self.config.delay_minutes} min) for confirmation")
                 else:
                     self._execute_entry(bar)
+            elif prob >= self.config.observation_threshold:
+                self.logger.info(f"  Observation only (prob={prob:.3f} < exec threshold)")
+                self.signal_logger.log_observation({
+                    'action': 'observation_only',
+                    'prob': prob,
+                    'bar_time': str(bar.get('time', '')),
+                    'or_high': self.state.or_high,
+                    'or_low': self.state.or_low,
+                })
             else:
-                self.logger.info(f"  Below threshold — NO SIGNAL")
+                self.logger.info(f"  Below observation threshold — NO SIGNAL")
 
     def _get_prediction(self, bar: Dict) -> Optional[float]:
         """

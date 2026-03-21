@@ -789,18 +789,39 @@ def run_portfolio_backtest(signal_specs: list, verbose: bool = True) -> dict:
                   f"{len(shared)}/{len(total)} days ({pct:.1%})")
 
     # Portfolio-level metrics
+    # Use the full daily_pnl series from each signal result (which has zero-pnl days
+    # for every trading day iterated, not just days with completed trades). This gives
+    # a correct all-days Sharpe that accounts for idle days.
     portfolio_metrics = {}
     if not combined_trades.empty:
-        daily_pnl = combined_trades.groupby('session_date')['pnl_dollars'].sum()
-        avg_daily = daily_pnl.mean()
-        std_daily = daily_pnl.std()
-        n_days = len(daily_pnl)
-        years = n_days / 252.0
+        # Combine all-day daily_pnl series from each signal
+        daily_series_list = []
+        for key, res in signal_results.items():
+            dpnl = res.get('daily_pnl')
+            if dpnl is not None and len(dpnl) > 0:
+                daily_series_list.append(dpnl.rename(key))
+
+        if daily_series_list:
+            # Outer join so union of all days is covered; NaN → 0 (no trade that day)
+            portfolio_daily = pd.concat(daily_series_list, axis=1).fillna(0).sum(axis=1)
+            portfolio_daily.index = pd.to_datetime(portfolio_daily.index)
+        else:
+            # Fallback: trade-days-only (inflated but better than nothing)
+            portfolio_daily = combined_trades.groupby('session_date')['pnl_dollars'].sum()
+            portfolio_daily.index = pd.to_datetime(portfolio_daily.index)
+
+        avg_daily = portfolio_daily.mean()
+        std_daily = portfolio_daily.std()
+        n_all_days = len(portfolio_daily)
+        # Correct years from actual calendar span, not trade-day count
+        span_days = (portfolio_daily.index.max() - portfolio_daily.index.min()).days
+        years = max(span_days / 365.25, 0.5)
         sharpe = (avg_daily / std_daily * np.sqrt(252)) if std_daily > 0 else 0
         total_pnl = combined_trades['pnl_dollars'].sum()
         n_trades = len(combined_trades)
         trades_per_yr = n_trades / years if years > 0 else 0
         win_rate = (combined_trades['pnl_dollars'] > 0).mean()
+        n_trade_days = combined_trades['session_date'].nunique()
 
         portfolio_metrics = {
             'n_trades': n_trades,
@@ -808,17 +829,19 @@ def run_portfolio_backtest(signal_specs: list, verbose: bool = True) -> dict:
             'total_pnl': total_pnl,
             'sharpe': sharpe,
             'win_rate': win_rate,
-            'n_trading_days': n_days,
+            'n_trade_days': n_trade_days,
+            'n_all_days': n_all_days,
+            'years': years,
         }
 
         print(f"\n{'='*72}")
         print("PORTFOLIO SUMMARY")
         print(f"{'='*72}")
         print(f"  Total trades:     {n_trades}")
-        print(f"  Trades/yr:        {trades_per_yr:.1f}")
+        print(f"  Trades/yr:        {trades_per_yr:.1f}  (span={years:.1f} yrs)")
         print(f"  Total P&L:        ${total_pnl:>+,.0f}")
         print(f"  Win rate:         {win_rate:.1%}")
-        print(f"  Daily Sharpe:     {sharpe:.2f}")
+        print(f"  Daily Sharpe:     {sharpe:.2f}  (all {n_all_days} days incl. idle)")
 
     return {
         'signal_results': signal_results,
@@ -1047,6 +1070,7 @@ def run_full_step7(verbose: bool = True, use_regime_filter: bool = False,
         'holdout_oos': holdout_oos,
         'oos_combined': oos_combined,
         'oos_predictions': oos_combined,  # alias for portfolio wrapper
+        'daily_pnl': bt_result['daily_pnl'],  # full all-days series for portfolio Sharpe
     }
 
     # P5-E: Save computed results to disk

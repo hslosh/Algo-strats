@@ -389,7 +389,9 @@ def compute_performance_metrics(sim_result: dict,
             max_loss_streak = max(max_loss_streak, current_streak)
 
     # ── Sharpe & Sortino (from daily returns) ──
-    daily_returns = daily_pnl[daily_pnl != 0]  # only trading days
+    # Include ALL trading days (zero = no trade). Using only trade-days inflates
+    # mean/std ratio by ~sqrt(252/trades_per_yr) and overstates Sharpe by 5-10x.
+    daily_returns = daily_pnl  # all days, zeros included
     if len(daily_returns) > 5:
         # Annualize: ~252 trading days
         mean_daily = daily_returns.mean()
